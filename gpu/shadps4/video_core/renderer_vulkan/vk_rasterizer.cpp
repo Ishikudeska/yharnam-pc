@@ -75,6 +75,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     pipeline_cache.WarmUp(); // after object motion: see PipelineCache::PipelineCache
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
+    rt_lighting = std::make_unique<RtLighting>(instance, scheduler, texture_cache, runtime);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -310,6 +311,19 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 upscaler->OnSceneComposite();
             }
         }
+    }
+    // bbport: ray tracing follows the G-buffer -> lighting -> scene color passes. Before the
+    // draw's own attachment transitions (BeginRenderingFull) and texture binding.
+    if (rt_lighting->Enabled()) {
+        std::array<VideoCore::ImageId, RtLighting::MaxTargets> colors{};
+        if (!skip_cb_binding) {
+            for (s32 cb = 0; cb < std::bit_width(key.mrt_mask) && cb < s32(colors.size()); ++cb) {
+                if (key.mrt_mask & (1u << cb)) {
+                    colors[cb] = cb_descs[cb].first;
+                }
+            }
+        }
+        rt_lighting->OnTargets(colors, db_desc.first);
     }
 }
 
@@ -1002,6 +1016,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
         camera_motion->SetJitter(upscaler->Jitter());
         object_motion->OnFrameStart();
+        rt_lighting->OnFrameStart(upscaler->Jitter());
         NoteFrameStart();
         static const char* scene_debug = std::getenv("BB_SCENE_DEBUG");
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
@@ -1131,6 +1146,38 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 .first_instance = first_instance,
                 .vertices = range,
             });
+            // bbport ray tracing: a G-buffer draw that stores its clip positions this frame
+            // goes into the acceleration structure (rt/rt_scene.h).
+            const bool triangles = regs.primitive_type == AmdGpu::PrimitiveType::TriangleList ||
+                                   regs.primitive_type == AmdGpu::PrimitiveType::TriangleStrip;
+            if (push_data.motion_param && gbuffer_draw && triangles &&
+                rt_lighting->CapturesGeometry() && (!is_indexed || index_bda)) {
+                const u32* params = object_motion->Params(push_data.motion_param);
+                if (params[3] & Shader::MotionVectors::FlagStore) {
+                    // The draw's identity across frames: what object motion matches on.
+                    const std::array<u64, 8> identity{
+                        vs.pgm_hash,  motion_geometry, index_address,
+                        topology,     regs.num_indices, regs.num_instances.NumInstances(),
+                        first_instance, (u64(range.first) << 32) | range.count};
+                    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                    rt_lighting->OnGeometryDraw({
+                        .key = XXH3_64bits(identity.data(), sizeof(identity)),
+                        .index_address = is_indexed ? index_bda : 0,
+                        .index_size = index_size,
+                        .topology = regs.primitive_type == AmdGpu::PrimitiveType::TriangleList
+                                        ? RtScene::Topology::List
+                                        : RtScene::Topology::Strip,
+                        .count = regs.num_indices,
+                        .instances = params[6],
+                        .store_base = params[0],
+                        .vertices = params[2],
+                        .first_vertex = params[4],
+                        .base_vertex = s32(base_vertex),
+                        .restart_enabled = regs.enable_primitive_restart != 0,
+                        .alpha_tested = ps && ps->has_discard,
+                    });
+                }
+            }
         }
     }
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
@@ -1983,12 +2030,17 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
+    index_bda = 0;
     if (index_buffer_size != 0) {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
         index_buffer = buffer->Handle();
         buffer_offset = offset;
+        // bbport ray tracing: the gather pass reads the indices (rt/rt_scene.cpp).
+        if (rt_lighting->CapturesGeometry()) {
+            index_bda = buffer->BufferDeviceAddress() + offset;
+        }
     } else if (!instance.IsMaintenance6Supported()) {
         const auto* null_buffer = buffer_cache.GetNullIndexBuffer();
         index_buffer_size = static_cast<u32>(null_buffer->SizeBytes());
@@ -2185,6 +2237,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 if (ring->size == 864 && gbuffer_draw &&
                     memory->IsValidGpuMapping(ring->address, 0)) {
                     camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
+                    rt_lighting->OnConstants(reinterpret_cast<const float*>(ring->address));
                 }
                 push_data.AddOffset(binding.buffer, 0);
             }
@@ -2246,6 +2299,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             if (vsharp.GetSize() == 864 && gbuffer_draw &&
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
+                rt_lighting->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
             }
             // Object motion research: the vertex shader buffers of G-buffer draws.
             if (FrameCapture::Active() && gbuffer_draw && stage.sw_stage == Shader::SwStage::Vertex &&

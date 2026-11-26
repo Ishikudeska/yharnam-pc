@@ -134,6 +134,12 @@ add_host_shader(depth_resample.frag depth_resample_frag)
 add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
 add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
 add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
+# Path tracing (docs/path_tracing.md, rt/rt_lighting.cpp): screen-space indirect light.
+add_host_shader(rt_gi_trace.comp rt_gi_trace_comp)
+add_host_shader(rt_gi_trace.comp rt_gi_trace_hw_comp HW_RAYS=1)
+add_host_shader(rt_gi_apply.comp rt_gi_apply_comp)
+add_host_shader(rt_gather.comp rt_gather_comp)
+add_host_shader(rt_validate.comp rt_validate_comp)
 # Frame generation (vk_frame_generation.cpp): its depth input and the UI over generated frames.
 add_host_shader(frame_gen_inputs.comp frame_gen_inputs_comp)
 add_host_shader(frame_gen_ui.comp frame_gen_ui_comp)

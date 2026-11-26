@@ -49,6 +49,12 @@ bool CreateBuffer(const Instance& instance, vk::DeviceSize size, bool host, vk::
 
 } // namespace
 
+u32 ObjectMotion::PositionBudget() {
+    const char* value = std::getenv("BB_OBJECT_MOTION_VERTICES");
+    const unsigned long parsed = value && value[0] ? std::strtoul(value, nullptr, 10) : 0;
+    return parsed >= (1ul << 20) && parsed <= (16ul << 20) ? static_cast<u32>(parsed) : 4u << 20;
+}
+
 ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_} {
     // Pipeline selection limits the extra attachment and vertex stores to likely
@@ -78,7 +84,7 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
     u64 params_address = 0, positions_address = 0;
     if (!CreateBuffer(instance, vk::DeviceSize(1 + FrameSlots * ParamsPerFrame) * 32, true,
                       params_buffer, params_allocation, &mapped, params_address) ||
-        !CreateBuffer(instance, vk::DeviceSize(1 + 2 * PositionsPerFrame) * 16, false,
+        !CreateBuffer(instance, vk::DeviceSize(1 + 2 * positions_per_frame) * 16, false,
                       positions_buffer, positions_allocation, nullptr, positions_address)) {
         std::printf("Object motion: buffer creation failed, off\n");
         return;
@@ -88,7 +94,7 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
     Shader::MotionVectors::params_address = params_address;
     Shader::MotionVectors::positions_address = positions_address;
     enabled = true;
-    std::printf("Object motion: on (%u vertices per frame)\n", PositionsPerFrame);
+    std::printf("Object motion: on (%u vertices per frame)\n", positions_per_frame);
 }
 
 ObjectMotion::~ObjectMotion() {
@@ -115,7 +121,7 @@ void ObjectMotion::OnFrameStart() {
                     (unsigned long long)s.loaded, (unsigned long long)s.unmatched,
                     (unsigned long long)s.exhausted, (unsigned long long)s.invalid,
                     (unsigned long long)s.still,
-                    history.Used(), PositionsPerFrame, (unsigned long long)index_ranges.stats.hits,
+                    history.Used(), positions_per_frame, (unsigned long long)index_ranges.stats.hits,
                     (unsigned long long)index_ranges.stats.scans,
                     (unsigned long long)index_ranges.stats.stale, index_ranges.Size());
         index_ranges.stats = {};

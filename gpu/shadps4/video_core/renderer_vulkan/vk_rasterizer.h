@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/rt/rt_lighting.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -337,6 +338,8 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
+    std::unique_ptr<RtLighting> rt_lighting;    // bbport: ray tracing (docs/path_tracing.md)
+    u64 index_bda{};                            ///< GPU address of the current draw's indices
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;

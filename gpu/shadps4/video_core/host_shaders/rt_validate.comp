@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport path tracing, step 4 (docs/path_tracing.md): checks the acceleration structure against
+// the rasterised frame. A ray from the camera through each pixel; output r = view z of the
+// closest hit (0: no hit), g = view z of the depth buffer (0: sky). Written for dumps only.
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform accelerationStructureEXT scene;
+layout(binding = 1) uniform texture2D depth_tex;
+layout(binding = 2, rg32f) uniform writeonly image2D result_img;
+
+layout(push_constant) uniform Constants {
+    vec4 inv_view[3]; // view -> world, rows (3x4)
+    vec4 proj;        // x scale, y scale, z scale, z offset
+    vec2 size;
+    vec2 jitter;      // viewport shift in pixels (x right, y down)
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    const float depth_z = depth >= 1.0 ? 0.0 : proj.w / min(depth - proj.z, -1e-8);
+    const vec2 uv = (vec2(pixel) + 0.5) / size - jitter / size;
+    const vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    const vec3 dir_view = normalize(vec3(ndc.x / proj.x, ndc.y / proj.y, 1.0));
+    const vec3 origin = vec3(inv_view[0].w, inv_view[1].w, inv_view[2].w);
+    const vec3 dir = vec3(dot(inv_view[0].xyz, dir_view), dot(inv_view[1].xyz, dir_view),
+                          dot(inv_view[2].xyz, dir_view));
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xFF, origin, 0.05, dir, 5000.0);
+    while (rayQueryProceedEXT(query)) {
+    }
+    float hit_z = 0.0;
+    if (rayQueryGetIntersectionTypeEXT(query, true) ==
+        gl_RayQueryCommittedIntersectionTriangleEXT) {
+        hit_z = rayQueryGetIntersectionTEXT(query, true) * dir_view.z;
+    }
+    imageStore(result_img, pixel, vec4(hit_z, depth_z, 0.0, 0.0));
+}

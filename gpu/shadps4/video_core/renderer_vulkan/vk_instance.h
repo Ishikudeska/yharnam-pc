@@ -314,6 +314,11 @@ public:
     }
 
     /// bbport: VK_NV_low_latency2 is enabled for its boost hint (Swapchain), without Streamline.
+    /// bbport: acceleration structures and ray queries are enabled (BB_RT=1, docs/path_tracing.md).
+    bool IsRayQuerySupported() const {
+        return ray_query;
+    }
+
     bool IsLowLatencyBoostEnabled() const {
         return low_latency_boost;
     }
@@ -596,6 +601,7 @@ private:
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool device_fault{};            // bbport: VK_EXT_device_fault (DeviceLost)
     bool low_latency_boost{};       // bbport: VK_NV_low_latency2 (+ VK_KHR_present_id), boost hint
+    bool ray_query{};               // bbport: acceleration structures + ray queries (BB_RT=1)
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

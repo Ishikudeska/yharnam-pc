@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport path tracing, step 3 (docs/path_tracing.md): screen-space indirect light at half
+// resolution. Each half-resolution pixel traces cosine-weighted rays from the full-resolution
+// pixel 2 * p through the depth buffer; a hit takes its light from the previous frame's finished
+// scene color (one more bounce every frame), a miss leaves the sky open.
+// Output, accumulated over frames: rgb = bounced light (irradiance / pi, the unit of the game's
+// ambient term), a = the fraction of rays that reached the sky; z image: view z, history length.
+// HW_RAYS (step 4): the rays are traced through the acceleration structure of the frame's
+// geometry (rt/rt_scene.cpp) instead of the depth buffer; a hit takes its light from the previous
+// frame where the hit point is visible on screen. Alpha-tested draws (leaves, grass: mask 2)
+// stop a ray with probability foliage_opacity, as their cut-out shapes are not traced.
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#ifdef HW_RAYS
+#extension GL_EXT_ray_query : require
+#endif
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex;     // D32, D3D depth 0..1 (full resolution)
+layout(binding = 1) uniform texture2D normal_tex;    // G-buffer 0: world normal * 0.5 + 0.5
+layout(binding = 2) uniform texture2D radiance_tex;  // previous frame's scene color (RGBA16F)
+layout(binding = 3) uniform texture2D history_tex;   // previous result (half resolution)
+layout(binding = 4) uniform texture2D history_z_tex; // previous view z (0 = none), length
+layout(binding = 5, rgba16f) uniform writeonly image2D result_img;
+layout(binding = 6, rg32f) uniform writeonly image2D result_z_img;
+#ifdef HW_RAYS
+layout(binding = 7) uniform accelerationStructureEXT scene;
+#endif
+
+layout(push_constant) uniform Constants {
+    vec4 view_rot[3];  // world -> view, rows (3x4: rotation, w = translation)
+    vec4 reproject[3]; // previous view * inverse current view, rows (3x4)
+    vec4 proj;         // current: x scale, y scale, z scale, z offset
+    vec4 prev_proj;    // previous camera
+    vec2 size;         // full-resolution pixels
+    vec2 jitter;       // current viewport shift in pixels (x right, y down)
+    vec2 prev_jitter;
+    float max_distance;  // ray length, view units
+    float thickness;     // assumed depth of a surface behind the depth buffer, view units
+    uint frame;
+    uint flags;          // 1: radiance history valid, 2: result history valid
+    float history_weight; // largest share of the accumulated result kept each frame (0..1)
+    float max_radiance;   // luminance clamp of hit radiance (fireflies)
+    vec4 inv_view[3];     // view -> world, rows (3x4), for HW_RAYS
+    float foliage_opacity; // HW_RAYS: probability that an alpha-tested draw stops a ray
+};
+
+const int RAYS = 2;
+const int STEPS = 16;
+const float MAX_HISTORY = 32.0;
+const float PI = 3.14159265;
+
+uint Hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float Random(inout uint state) {
+    state = Hash(state);
+    return float(state >> 8) * (1.0 / 16777216.0);
+}
+
+float ViewZ(float depth) {
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+vec3 ViewPosition(vec2 pixel_center, float z) {
+    const vec2 uv = pixel_center / size - jitter / size;
+    const vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    return vec3(ndc.x * z / proj.x, ndc.y * z / proj.y, z);
+}
+
+/// Full-resolution pixel of a view-space point in this frame, or false off screen.
+bool ScreenPixel(vec3 p, out ivec2 pixel) {
+    if (p.z <= 0.05) {
+        return false;
+    }
+    const vec2 ndc = p.xy * proj.xy / p.z;
+    if (any(greaterThan(abs(ndc), vec2(1.0)))) {
+        return false;
+    }
+    const vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) + jitter / size;
+    pixel = clamp(ivec2(uv * size), ivec2(0), ivec2(size) - 1);
+    return true;
+}
+
+/// Full-resolution position (pixels) of a view-space point of this frame in the previous frame,
+/// and its previous view z.
+bool PreviousPosition(vec3 p, out vec2 position, out float prev_z) {
+    const vec4 v = vec4(p, 1.0);
+    const vec3 prev = vec3(dot(reproject[0], v), dot(reproject[1], v), dot(reproject[2], v));
+    prev_z = prev.z;
+    if (prev.z <= 0.05) {
+        return false;
+    }
+    const vec2 ndc = prev.xy * prev_proj.xy / prev.z;
+    if (any(greaterThan(abs(ndc), vec2(1.0)))) {
+        return false;
+    }
+    position = (vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) + prev_jitter / size) * size;
+    return true;
+}
+
+vec3 CosineDirection(vec3 n, float u1, float u2) {
+    const vec3 helper = abs(n.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    const vec3 t = normalize(cross(helper, n));
+    const vec3 b = cross(n, t);
+    const float r = sqrt(u1), phi = 2.0 * PI * u2;
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+}
+
+void main() {
+    const ivec2 half_size = (ivec2(size) + 1) / 2;
+    const ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (cell.x >= half_size.x || cell.y >= half_size.y) {
+        return;
+    }
+    const ivec2 pixel = min(cell * 2, ivec2(size) - 1);
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    if (depth >= 1.0) {
+        imageStore(result_img, cell, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(result_z_img, cell, vec4(0.0));
+        return;
+    }
+    const float z = ViewZ(depth);
+    const vec3 p = ViewPosition(vec2(pixel) + 0.5, z);
+    const vec3 nw = texelFetch(normal_tex, pixel, 0).rgb * 2.0 - 1.0;
+    vec3 n = vec3(dot(view_rot[0].xyz, nw), dot(view_rot[1].xyz, nw), dot(view_rot[2].xyz, nw));
+    n = dot(n, n) > 1e-4 ? normalize(n) : normalize(-p);
+
+    uint state = Hash(uint(cell.x) * 1973U + uint(cell.y) * 9277U + frame * 26699U) | 1U;
+    vec3 bounce = vec3(0.0);
+    float open = 0.0;
+    const vec3 origin = p + n * (0.02 + 0.003 * z);
+    for (int r = 0; r < RAYS; ++r) {
+        const vec3 dir = CosineDirection(n, Random(state), Random(state));
+        const float offset = Random(state);
+        bool hit = false;
+#ifdef HW_RAYS
+        // World-space ray through the frame's geometry.
+        const vec4 origin_view = vec4(origin, 1.0);
+        const vec3 origin_world = vec3(dot(inv_view[0], origin_view), dot(inv_view[1], origin_view),
+                                       dot(inv_view[2], origin_view));
+        const vec3 dir_world = vec3(dot(inv_view[0].xyz, dir), dot(inv_view[1].xyz, dir),
+                                    dot(inv_view[2].xyz, dir));
+        const uint mask = offset < foliage_opacity ? 0x03u : 0x01u;
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, mask, origin_world, 0.0,
+                              dir_world, max_distance);
+        while (rayQueryProceedEXT(query)) {
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, true) ==
+            gl_RayQueryCommittedIntersectionTriangleEXT) {
+            hit = true;
+            // The light leaving the hit point, from the previous frame, if the point is on
+            // screen and not hidden (else no bounced light from it yet).
+            const vec3 hit_view = origin + dir * rayQueryGetIntersectionTEXT(query, true);
+            ivec2 q_pixel;
+            if ((flags & 1U) != 0U && ScreenPixel(hit_view, q_pixel)) {
+                const float scene_depth = texelFetch(depth_tex, q_pixel, 0).r;
+                const float scene_z = scene_depth >= 1.0 ? 1e9 : ViewZ(scene_depth);
+                vec2 prev_position;
+                float prev_z;
+                if (abs(scene_z - hit_view.z) < 0.05 * hit_view.z + 0.05 &&
+                    PreviousPosition(hit_view, prev_position, prev_z)) {
+                    const ivec2 prev_pixel =
+                        clamp(ivec2(prev_position), ivec2(0), ivec2(size) - 1);
+                    vec3 radiance = max(texelFetch(radiance_tex, prev_pixel, 0).rgb, vec3(0.0));
+                    const float luma = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+                    if (luma > max_radiance) {
+                        radiance *= max_radiance / luma;
+                    }
+                    bounce += radiance;
+                }
+            }
+        }
+#else
+        for (int i = 0; i < STEPS && !hit; ++i) {
+            const float s = (float(i) + offset) / float(STEPS);
+            const vec3 q = origin + dir * (max_distance * s * s + 0.01);
+            ivec2 q_pixel;
+            if (!ScreenPixel(q, q_pixel)) {
+                break; // left the screen: unknown, counted as open sky
+            }
+            const float scene_depth = texelFetch(depth_tex, q_pixel, 0).r;
+            if (scene_depth >= 1.0) {
+                continue;
+            }
+            const float scene_z = ViewZ(scene_depth);
+            const float behind = q.z - scene_z;
+            if (behind > 0.01 * scene_z && behind < thickness + 0.02 * scene_z) {
+                hit = true;
+                // The light leaving the surface that was hit, from the previous frame.
+                const vec3 s_view = ViewPosition(vec2(q_pixel) + 0.5, scene_z);
+                vec2 prev_position;
+                float prev_z;
+                if ((flags & 1U) != 0U && PreviousPosition(s_view, prev_position, prev_z)) {
+                    const ivec2 prev_pixel =
+                        clamp(ivec2(prev_position), ivec2(0), ivec2(size) - 1);
+                    vec3 radiance = max(texelFetch(radiance_tex, prev_pixel, 0).rgb, vec3(0.0));
+                    const float luma = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+                    if (luma > max_radiance) {
+                        radiance *= max_radiance / luma;
+                    }
+                    bounce += radiance;
+                }
+            }
+        }
+#endif
+        open += hit ? 0.0 : 1.0;
+    }
+    const vec4 current = vec4(bounce / float(RAYS), open / float(RAYS));
+
+    // Temporal accumulation: the same surface in the previous result, bilinear over the four
+    // nearest half-resolution samples that saw it (a sample at cell h was traced at pixel 2h).
+    vec4 history = vec4(0.0);
+    float history_length = 0.0, history_weight_sum = 0.0;
+    vec2 prev_position;
+    float prev_z;
+    if ((flags & 2U) != 0U && PreviousPosition(p, prev_position, prev_z)) {
+        const vec2 u = (prev_position - 0.5) * 0.5;
+        const ivec2 base = ivec2(floor(u));
+        const vec2 f = u - vec2(base);
+        for (int i = 0; i < 4; ++i) {
+            const ivec2 offset = ivec2(i & 1, i >> 1);
+            const ivec2 tap = base + offset;
+            if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, half_size))) {
+                continue;
+            }
+            const vec2 tap_z = texelFetch(history_z_tex, tap, 0).rg;
+            if (tap_z.x <= 0.0 || abs(tap_z.x - prev_z) > 0.03 * prev_z + 0.02) {
+                continue;
+            }
+            const float w = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
+            history += texelFetch(history_tex, tap, 0) * w;
+            history_length += tap_z.y * w;
+            history_weight_sum += w;
+        }
+    }
+    vec4 result = current;
+    float length = 1.0;
+    if (history_weight_sum > 0.05) {
+        history /= history_weight_sum;
+        length = min(history_length / history_weight_sum + 1.0, MAX_HISTORY);
+        // New surfaces converge quickly; settled ones keep at most history_weight of the past.
+        result = mix(history, current, max(1.0 / length, 1.0 - history_weight));
+    }
+    imageStore(result_img, cell, result);
+    imageStore(result_z_img, cell, vec4(z, length, 0.0, 0.0));
+}

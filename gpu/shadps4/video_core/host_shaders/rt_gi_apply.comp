@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport path tracing, step 3 (docs/path_tracing.md): upsamples and filters the half-resolution
+// indirect light (rt_gi_trace.comp) with an edge-aware blur and writes it into the game's
+// ambient term, the G-buffer's B10G11R11 target, before the lighting pass reads it:
+//     ambient = ambient * mix(1, sky visibility, ao_strength) + bounced light * bounce_strength
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex;  // D32 (full resolution)
+layout(binding = 1) uniform texture2D normal_tex; // world normal * 0.5 + 0.5
+layout(binding = 2) uniform texture2D gi_tex;     // half resolution: rgb bounce, a visibility
+layout(binding = 3) uniform texture2D gi_z_tex;   // half resolution: view z (0 = sky), length
+layout(binding = 4, r11f_g11f_b10f) uniform image2D ambient_img;
+
+layout(push_constant) uniform Constants {
+    vec4 proj;    // x scale, y scale, z scale, z offset
+    vec2 size;    // full-resolution pixels
+    float ao_strength;
+    float bounce_strength;
+    uint mode;    // 0 normal, 1 bounced light only (debug), 2 sky visibility only (debug)
+};
+
+float ViewZ(float depth) {
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    if (depth >= 1.0) {
+        return;
+    }
+    const float z = ViewZ(depth);
+    const vec3 n = texelFetch(normal_tex, pixel, 0).rgb * 2.0 - 1.0;
+    const ivec2 half_size = (ivec2(size) + 1) / 2;
+    const ivec2 center = pixel / 2;
+
+    // 5x5 half-resolution samples (a 10x10 pixel area). Sample h was traced at pixel 2h:
+    // weighted by its distance to this pixel, its depth and its normal.
+    vec4 sum = vec4(0.0);
+    float weight_sum = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            const ivec2 tap = clamp(center + ivec2(x, y), ivec2(0), half_size - 1);
+            const float tap_z = texelFetch(gi_z_tex, tap, 0).r;
+            if (tap_z <= 0.0) {
+                continue;
+            }
+            const ivec2 source = min(tap * 2, ivec2(size) - 1);
+            const vec2 d = vec2(source - pixel);
+            const vec3 tap_n = texelFetch(normal_tex, source, 0).rgb * 2.0 - 1.0;
+            const float w = exp(-dot(d, d) / 18.0) *
+                            exp(-abs(tap_z - z) / (0.02 * z + 0.01)) *
+                            pow(max(dot(tap_n, n), 0.0), 16.0);
+            sum += texelFetch(gi_tex, tap, 0) * w;
+            weight_sum += w;
+        }
+    }
+    const vec4 gi = weight_sum > 1e-5 ? sum / weight_sum
+                                      : texelFetch(gi_tex, clamp(center, ivec2(0), half_size - 1), 0);
+
+    const vec3 ambient = imageLoad(ambient_img, pixel).rgb;
+    vec3 result = ambient * mix(1.0, gi.a, ao_strength) + gi.rgb * bounce_strength;
+    if (mode == 1u) {
+        result = gi.rgb * bounce_strength;
+    } else if (mode == 2u) {
+        result = vec3(gi.a * 0.25);
+    }
+    imageStore(ambient_img, pixel, vec4(max(result, vec3(0.0)), 1.0));
+}

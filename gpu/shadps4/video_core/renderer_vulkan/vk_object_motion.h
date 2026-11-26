@@ -31,6 +31,12 @@ public:
 
     using DrawInfo = Motion::Draw;
     u32 PrepareDraw(const DrawInfo& draw);
+    /// bbport ray tracing (rt/rt_scene.h): what PrepareDraw wrote for its returned index,
+    /// u32[8]: store base, load base, vertices per instance, flags (Shader::MotionVectors),
+    /// first vertex, first instance, instances.
+    [[nodiscard]] const u32* Params(u32 index) const noexcept {
+        return params_mapped + index * 8;
+    }
     /// Small skeletons: whether the bone palette changed (Motion::History::Moving).
     bool Moving(const Motion::History::GateKey& key, u64 palette) {
         return history.Moving(key, palette);
@@ -97,8 +103,11 @@ private:
     static constexpr u32 FrameSlots = 4;
     static constexpr u32 ParamsPerFrame = 8192;
     // Positions (device local): two halves (current/previous frame) of vec4; element 0 is reserved.
-    static constexpr u32 PositionsPerFrame = 4u << 20;
-    Motion::History history{PositionsPerFrame};
+    /// bbport: positions per frame, BB_OBJECT_MOTION_VERTICES (default 4 Mi, 1-16 Mi; two
+    /// frames are kept, 16 bytes each). Ray tracing stores every G-buffer draw: more are needed.
+    static u32 PositionBudget();
+    const u32 positions_per_frame = PositionBudget();
+    Motion::History history{positions_per_frame};
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
     vk::Buffer params_buffer{};

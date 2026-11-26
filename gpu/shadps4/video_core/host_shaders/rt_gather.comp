@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport path tracing, step 4 (docs/path_tracing.md): the world-space triangles of this frame's
+// G-buffer draws, one bottom-level acceleration structure per draw (rt/rt_scene.cpp). The
+// draws' vertex shaders stored their clip positions (object motion, emit_spirv_special.cpp);
+// each thread reads the three indices of one triangle and turns the positions into world space
+// with the camera: clip = (xs * x, ys * y, zs * z + zo, z), so view = (clip.x / xs, clip.y / ys,
+// clip.w). Each draw has its own vertex storage, the input of its BLAS: the triangle is compared
+// with what is stored there (a draw that moved is flagged for the CPU, which reads the flags a
+// few frames later and refits its BLAS while it keeps moving), and written there when the BLAS
+// is built or refit this frame. Triangles that cannot be read get NaN: inactive in the BLAS.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+struct Draw {
+    uint64_t index_address; // index data on the GPU; 0 for draws without indices
+    uint64_t storage;       // this draw's vertex storage: 9 floats per triangle
+    uint index_size;        // 2 or 4 bytes
+    uint topology;          // 0 triangle list, 1 triangle strip
+    uint triangles;         // per instance
+    uint instances;
+    uint first_triangle;    // first thread of this draw
+    uint store_base;        // first stored clip position of this draw
+    uint vertices;          // stored positions per instance
+    uint first_vertex;      // vertex index of the first stored position
+    int base_vertex;        // added to each index
+    uint restart;           // primitive restart index
+    uint flags;             // 1: primitive restart enabled, 2: write the storage, 4: alpha-tested
+    uint draw_index;        // this draw's slot in the changed flags
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Draws {
+    Draw draws[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Positions {
+    vec4 positions[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Word {
+    uint word;
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Vertices {
+    float values[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Flags {
+    uint changed[];  // per draw: [2i] moved, [2i + 1] a triangle became valid or invalid
+};
+
+layout(push_constant) uniform Constants {
+    vec4 inv_view[3];        // view -> world, rows (3x4)
+    vec4 proj;               // x scale, y scale, z scale, z offset
+    uint64_t positions;      // object motion positions (vec4 per stored vertex)
+    uint64_t draw_list;      // Draw records, sorted by first_triangle
+    uint64_t changed_flags;  // one u32 per draw, set to 1 when the draw moved
+    uint draw_count;
+    uint triangle_count;
+};
+
+uint ReadIndex(Draw draw, uint position) {
+    const uint64_t address = draw.index_address + uint64_t(position) * uint64_t(draw.index_size);
+    const uint value = Word(address & ~uint64_t(3)).word;
+    return draw.index_size == 4u ? value : (value >> (uint(address & uint64_t(2)) * 8u)) & 0xFFFFu;
+}
+
+void main() {
+    const uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint t = group * 64u + gl_LocalInvocationID.x;
+    if (t >= triangle_count) {
+        return;
+    }
+    // The draw this triangle belongs to.
+    Draws list = Draws(draw_list);
+    uint lo = 0u, hi = draw_count - 1u;
+    while (lo < hi) {
+        const uint mid = (lo + hi + 1u) >> 1;
+        if (list.draws[mid].first_triangle <= t) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    const Draw draw = list.draws[lo];
+    const uint local = t - draw.first_triangle;
+    const uint instance = local / max(draw.triangles, 1u);
+    const uint triangle = local - instance * draw.triangles;
+
+    Positions stored = Positions(positions);
+    bool valid = instance < draw.instances;
+    vec3 world[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        const uint position = draw.topology == 0u ? triangle * 3u + k : triangle + k;
+        uint index = position;
+        if (draw.index_address != 0ul) {
+            index = ReadIndex(draw, position);
+            if ((draw.flags & 1u) != 0u && index == draw.restart) {
+                valid = false;
+            }
+        }
+        const uint relative = uint(int(index) + draw.base_vertex) - draw.first_vertex;
+        if (relative >= draw.vertices) {
+            valid = false;
+            world[k] = vec3(0.0);
+            continue;
+        }
+        const vec4 clip = stored.positions[draw.store_base + relative + instance * draw.vertices];
+        const vec4 view = vec4(clip.x / proj.x, clip.y / proj.y, clip.w, 1.0);
+        world[k] = vec3(dot(inv_view[0], view), dot(inv_view[1], view), dot(inv_view[2], view));
+        if (any(isnan(world[k])) || any(isinf(world[k]))) {
+            valid = false;
+        }
+    }
+
+    // Compare with the storage (the positions the BLAS was last built or refit with). World
+    // positions rebuilt from clip space wobble by float rounding as the camera moves: a
+    // centimetre plus a little with distance from the origin counts as unchanged.
+    Vertices out_vertices = Vertices(draw.storage);
+    const uint base = local * 9u;
+    // Plain stores of 1 (every writer stores the same value): no atomics on host memory.
+    bool moved = false, validity = false;
+    for (uint k = 0u; k < 3u; ++k) {
+        const vec3 old = vec3(out_vertices.values[base + k * 3u + 0u],
+                              out_vertices.values[base + k * 3u + 1u],
+                              out_vertices.values[base + k * 3u + 2u]);
+        const bool old_valid = !isnan(old.x);
+        if (old_valid != valid) {
+            validity = true; // a refit must keep each triangle's validity: rebuild
+        } else if (valid) {
+            const vec3 d = abs(world[k] - old);
+            // Alpha-tested draws (leaves, grass, flag 4) sway in the wind every frame; they are
+            // traced approximately anyway: only larger moves count.
+            const float tolerance = ((draw.flags & 4u) != 0u ? 0.25 : 0.01) + 2e-5 * length(world[k]);
+            moved = moved || max(d.x, max(d.y, d.z)) > tolerance;
+        }
+    }
+    if (moved || validity) {
+        Flags(changed_flags).changed[draw.draw_index * 2u] = 1u;
+    }
+    if (validity) {
+        Flags(changed_flags).changed[draw.draw_index * 2u + 1u] = 1u;
+    }
+    if ((draw.flags & 2u) != 0u) {
+        const float nan_value = uintBitsToFloat(0x7fc00000u);
+        for (uint k = 0u; k < 3u; ++k) {
+            out_vertices.values[base + k * 3u + 0u] = valid ? world[k].x : nan_value;
+            out_vertices.values[base + k * 3u + 1u] = valid ? world[k].y : nan_value;
+            out_vertices.values[base + k * 3u + 2u] = valid ? world[k].z : nan_value;
+        }
+    }
+}

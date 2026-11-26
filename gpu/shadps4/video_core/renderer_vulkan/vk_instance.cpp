@@ -271,7 +271,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
-        vk::PhysicalDeviceFaultFeaturesEXT>();
+        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+        vk::PhysicalDeviceRayQueryFeaturesKHR>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -445,6 +446,24 @@ bool Instance::CreateDevice() {
     } else {
         low_latency_boost = add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                             add_extension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+    }
+    // bbport path tracing (docs/path_tracing.md): acceleration structures and ray queries, only
+    // with BB_RT=1 and BB_RT_SCENE=1, so the device is unchanged without them.
+    const char* rt = std::getenv("BB_RT");
+    const char* rt_scene = std::getenv("BB_RT_SCENE");
+    if (rt && rt[0] == '1' && rt_scene && rt_scene[0] == '1') {
+        const bool supported =
+            feature_chain.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>()
+                .accelerationStructure &&
+            feature_chain.get<vk::PhysicalDeviceRayQueryFeaturesKHR>().rayQuery &&
+            feature_chain.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress &&
+            offered(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+            offered(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+            offered(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        ray_query = supported && add_extension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+                    add_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+                    add_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        std::printf("GPU: ray queries %s\n", ray_query ? "on" : "unavailable");
     }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
@@ -649,7 +668,17 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceFaultFeaturesEXT{
             .deviceFault = true,
         },
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR{
+            .accelerationStructure = true,
+        },
+        vk::PhysicalDeviceRayQueryFeaturesKHR{
+            .rayQuery = true,
+        },
     };
+    if (!ray_query) {
+        device_chain.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+        device_chain.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
+    }
 
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
@@ -787,8 +816,12 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // bbport path tracing: the acceleration structure cache checks the real device memory
+    // budget (rt/rt_scene.cpp), VK_EXT_memory_budget through VMA; only with ray queries.
+    const VmaAllocatorCreateFlags budget_flag =
+        ray_query && supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0;
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT | budget_flag,
         .physicalDevice = physical_device,
         .device = *device,
         .pVulkanFunctions = &functions,
